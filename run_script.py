@@ -45,7 +45,7 @@ ES_SYSTEM_REQUIRED = 0x00000001
 ES_DISPLAY_REQUIRED = 0x00000002
 NO_WINDOW = subprocess.CREATE_NO_WINDOW
 GAME_START_TIMEOUT_SECONDS = 10 * 60
-TEST_MODE_DELAY_SECONDS = 10
+QUICK_MODE_DELAY_SECONDS = 10
 
 
 @dataclass(frozen=True)
@@ -118,8 +118,8 @@ def nonnegative_int(values: dict[str, str], key: str) -> int:
 def load_config() -> Config:
     values = load_environment()
     mode = values.get("MODE", "normal").strip().lower()
-    if mode not in {"normal", "test"}:
-        raise ValueError("MODE must be either 'normal' or 'test'")
+    if mode not in {"normal", "quick", "test"}:
+        raise ValueError("MODE must be 'normal', 'quick', or 'test'")
     groups_key = "TEST_GROUPS" if mode == "test" else "NORMAL_GROUPS"
     groups = [name.strip() for name in values.get(groups_key, "").split(",") if name.strip()]
     if not groups:
@@ -155,8 +155,8 @@ def scheduled_time(config: Config, now: datetime) -> datetime:
 
 
 def wait_for_schedule(config: Config, logger: logging.Logger, started_at: datetime) -> None:
-    if config.mode == "test":
-        target = started_at + timedelta(seconds=TEST_MODE_DELAY_SECONDS)
+    if config.mode in {"quick", "test"}:
+        target = started_at + timedelta(seconds=QUICK_MODE_DELAY_SECONDS)
     else:
         target = scheduled_time(config, datetime.now(LOCAL_TIMEZONE))
     seconds = max(0, (target - datetime.now(LOCAL_TIMEZONE)).total_seconds())
