@@ -7,6 +7,7 @@ Required settings:
     BASE_TIME=04:03
     DAILY_OFFSET_MINUTES=3
     CYCLE_DAYS=10
+    END_ACTION=hibernate
 
 Only when MODE=test:
     TEST_GROUPS=Test Group
@@ -56,6 +57,7 @@ class Config:
     daily_offset_minutes: int
     cycle_days: int
     bettergi_directory: Path
+    end_action: str
 
 
 def configure_logging() -> logging.Logger:
@@ -122,6 +124,9 @@ def load_config() -> Config:
     groups = [name.strip() for name in values.get(groups_key, "").split(",") if name.strip()]
     if not groups:
         raise ValueError(f"{groups_key} must contain one or more comma-separated group names")
+    end_action = values.get("END_ACTION", "hibernate").strip().lower()
+    if end_action not in {"hibernate", "shutdown"}:
+        raise ValueError("END_ACTION must be either 'hibernate' or 'shutdown'")
     hour, minute = parse_time(values.get("BASE_TIME", ""))
     return Config(
         groups=groups,
@@ -131,6 +136,7 @@ def load_config() -> Config:
         daily_offset_minutes=nonnegative_int(values, "DAILY_OFFSET_MINUTES"),
         cycle_days=positive_int(values, "CYCLE_DAYS"),
         bettergi_directory=Path(values.get("BETTERGI_DIRECTORY", r"C:\Program Files\BetterGI")),
+        end_action=end_action,
     )
 
 
@@ -305,7 +311,7 @@ def main() -> int:
     )
 
     system = SystemState(logger)
-    hibernate = True
+    run_end_action = True
     try:
         system.prepare()                     # Prepare: prevent sleep, mute audio, dim brightness.
         wait_for_schedule(config, logger, started_at)
@@ -316,17 +322,17 @@ def main() -> int:
         stop_bettergi_if_exist(logger)
         return 0 if game_started else 1
     except KeyboardInterrupt:
-        hibernate = False
-        logger.info("Interrupted by user; Windows will not hibernate.")
+        run_end_action = False
+        logger.info("Interrupted by user; the configured end action will not run.")
         return 130
     except Exception:
         logger.exception("Runner failed.")
         return 1
     finally:
         system.restore()
-        if hibernate:
-            launch_helper("hibernate")
-            logger.info("Runner is exiting; Windows will hibernate in 10 seconds.")
+        if run_end_action:
+            launch_helper(config.end_action)
+            logger.info("Runner is exiting; Windows will %s in 10 seconds.", config.end_action)
 
 
 if __name__ == "__main__":

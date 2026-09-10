@@ -26,6 +26,10 @@ def main() -> int:
         time.sleep(10)
         subprocess.run(["shutdown", "/h"], check=False)
         return 0
+    if mode == "shutdown":
+        time.sleep(10)
+        subprocess.run(["shutdown", "/s", "/t", "0"], check=False)
+        return 0
     raise ValueError(f"Unknown helper mode: {mode}")
 
 
