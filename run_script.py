@@ -7,6 +7,7 @@ Required settings:
     BASE_TIME=04:03
     DAILY_OFFSET_MINUTES=3
     CYCLE_DAYS=10
+    YUANSHEN_CLOSE_TIMEOUT_MINUTES=120
     END_ACTION=hibernate
 
 Only when MODE=test:
@@ -57,6 +58,7 @@ class Config:
     daily_offset_minutes: int
     cycle_days: int
     bettergi_directory: Path
+    yuanshen_close_timeout_minutes: int
     end_action: str
 
 
@@ -136,6 +138,7 @@ def load_config() -> Config:
         daily_offset_minutes=nonnegative_int(values, "DAILY_OFFSET_MINUTES"),
         cycle_days=positive_int(values, "CYCLE_DAYS"),
         bettergi_directory=Path(values.get("BETTERGI_DIRECTORY", r"C:\Program Files\BetterGI")),
+        yuanshen_close_timeout_minutes=positive_int(values, "YUANSHEN_CLOSE_TIMEOUT_MINUTES"),
         end_action=end_action,
     )
 
@@ -256,25 +259,67 @@ def start_bettergi(config: Config, logger: logging.Logger) -> None:
     subprocess.Popen(command)
 
 
-def yuanshen_running() -> bool:
-    return any(
-        (process.info["name"] or "").lower() == "yuanshen.exe"
-        for process in psutil.process_iter(["name"])
+def yuanshen_processes() -> list[psutil.Process]:
+    return [
+        process for process in psutil.process_iter(["pid", "name"])
+        if (process.info["name"] or "").lower() == "yuanshen.exe"
+    ]
+
+
+def stop_yuanshen_after_timeout(logger: logging.Logger) -> None:
+    processes = yuanshen_processes()
+    if not processes:
+        logger.warning("Timeout fallback checked YuanShen.exe: process does not exist.")
+        return
+
+    logger.warning(
+        "Timeout fallback checked YuanShen.exe: process exists (pids=%s); forcing it to close.",
+        [process.pid for process in processes],
     )
+    for process in processes:
+        with suppress(psutil.NoSuchProcess, psutil.AccessDenied):
+            process.kill()
+    _, alive = psutil.wait_procs(processes, timeout=10)
+    if alive:
+        logger.error("YuanShen.exe still running after kill: %s", [process.pid for process in alive])
+    else:
+        logger.info("YuanShen.exe was forcibly closed by the timeout fallback.")
 
 
-def wait_for_yuanshen_to_close(logger: logging.Logger, start_deadline: float) -> bool:
-    logger.info("Waiting for YuanShen.exe to start and then close.")
-    seen_running = yuanshen_running()
+def wait_for_yuanshen_to_close(
+    logger: logging.Logger,
+    start_deadline: float,
+    close_timeout_minutes: int,
+) -> bool:
+    logger.info(
+        "Waiting for YuanShen.exe to start and then close (close timeout: %d minutes).",
+        close_timeout_minutes,
+    )
+    seen_running = bool(yuanshen_processes())
+    close_deadline = (
+        time.monotonic() + close_timeout_minutes * 60 if seen_running else None
+    )
     stopped_at: float | None = None
     while True:
-        if yuanshen_running():
+        now = time.monotonic()
+        if yuanshen_processes():
+            if not seen_running:
+                close_deadline = now + close_timeout_minutes * 60
+                logger.info("YuanShen.exe started; close timeout countdown begins.")
             seen_running, stopped_at = True, None
+            if close_deadline is not None and now >= close_deadline:
+                logger.error(
+                    "Abnormal run: YuanShen.exe did not close within %d minutes.",
+                    close_timeout_minutes,
+                )
+                stop_yuanshen_after_timeout(logger)
+                return False
         elif seen_running:
-            stopped_at = stopped_at or time.monotonic()
-            if time.monotonic() - stopped_at >= 10:
+            stopped_at = stopped_at or now
+            if now - stopped_at >= 10:
+                logger.info("YuanShen.exe has closed.")
                 return True
-        elif time.monotonic() >= start_deadline:
+        elif now >= start_deadline:
             logger.error("YuanShen.exe did not start within 10 minutes; ending this run.")
             return False
         time.sleep(1)
@@ -309,6 +354,7 @@ def main() -> int:
         config.mode,
         config.base_hour, config.base_minute, config.daily_offset_minutes, config.cycle_days,
     )
+    logger.info("YuanShen.exe close timeout: %d minutes.", config.yuanshen_close_timeout_minutes)
 
     system = SystemState(logger)
     run_end_action = True
@@ -318,9 +364,13 @@ def main() -> int:
         game_start_deadline = time.monotonic() + GAME_START_TIMEOUT_SECONDS
         stop_bettergi_if_exist(logger, True) # Prepare: remove an old BetterGI instance.
         start_bettergi(config, logger)       # Run BetterGI.
-        game_started = wait_for_yuanshen_to_close(logger, game_start_deadline)
+        game_closed_normally = wait_for_yuanshen_to_close(
+            logger,
+            game_start_deadline,
+            config.yuanshen_close_timeout_minutes,
+        )
         stop_bettergi_if_exist(logger)
-        return 0 if game_started else 1
+        return 0 if game_closed_normally else 1
     except KeyboardInterrupt:
         run_end_action = False
         logger.info("Interrupted by user; the configured end action will not run.")
