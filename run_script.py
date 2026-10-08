@@ -1,18 +1,5 @@
 #!/usr/bin/env python
-"""Run BetterGI once per day according to .env or process environment settings.
-
-Required settings:
-    NORMAL_GROUPS=Group A,Group B
-    MODE=normal
-    BASE_TIME=04:03
-    DAILY_OFFSET_MINUTES=3
-    CYCLE_DAYS=10
-    YUANSHEN_CLOSE_TIMEOUT_MINUTES=120
-    END_ACTION=hibernate
-
-Only when MODE=test:
-    TEST_GROUPS=Test Group
-"""
+"""Run BetterGI once per day according to .env or process environment settings."""
 
 from __future__ import annotations
 
@@ -45,20 +32,17 @@ ES_CONTINUOUS = 0x80000000
 ES_SYSTEM_REQUIRED = 0x00000001
 ES_DISPLAY_REQUIRED = 0x00000002
 NO_WINDOW = subprocess.CREATE_NO_WINDOW
-GAME_START_TIMEOUT_SECONDS = 10 * 60
 QUICK_MODE_DELAY_SECONDS = 10
 
 
 @dataclass(frozen=True)
 class Config:
-    groups: list[str]
     mode: str
     base_hour: int
     base_minute: int
     daily_offset_minutes: int
     cycle_days: int
     bettergi_directory: Path
-    yuanshen_close_timeout_minutes: int
     end_action: str
 
 
@@ -120,25 +104,19 @@ def nonnegative_int(values: dict[str, str], key: str) -> int:
 def load_config() -> Config:
     values = load_environment()
     mode = values.get("MODE", "normal").strip().lower()
-    if mode not in {"normal", "quick", "test"}:
-        raise ValueError("MODE must be 'normal', 'quick', or 'test'")
-    groups_key = "TEST_GROUPS" if mode == "test" else "NORMAL_GROUPS"
-    groups = [name.strip() for name in values.get(groups_key, "").split(",") if name.strip()]
-    if not groups:
-        raise ValueError(f"{groups_key} must contain one or more comma-separated group names")
+    if mode not in {"normal", "quick"}:
+        raise ValueError("MODE must be 'normal' or 'quick'")
     end_action = values.get("END_ACTION", "hibernate").strip().lower()
     if end_action not in {"hibernate", "shutdown"}:
         raise ValueError("END_ACTION must be either 'hibernate' or 'shutdown'")
     hour, minute = parse_time(values.get("BASE_TIME", ""))
     return Config(
-        groups=groups,
         mode=mode,
         base_hour=hour,
         base_minute=minute,
         daily_offset_minutes=nonnegative_int(values, "DAILY_OFFSET_MINUTES"),
         cycle_days=positive_int(values, "CYCLE_DAYS"),
         bettergi_directory=Path(values.get("BETTERGI_DIRECTORY", r"C:\Program Files\BetterGI")),
-        yuanshen_close_timeout_minutes=positive_int(values, "YUANSHEN_CLOSE_TIMEOUT_MINUTES"),
         end_action=end_action,
     )
 
@@ -158,7 +136,7 @@ def scheduled_time(config: Config, now: datetime) -> datetime:
 
 
 def wait_for_schedule(config: Config, logger: logging.Logger, started_at: datetime) -> None:
-    if config.mode in {"quick", "test"}:
+    if config.mode == "quick":
         target = started_at + timedelta(seconds=QUICK_MODE_DELAY_SECONDS)
     else:
         target = scheduled_time(config, datetime.now(LOCAL_TIMEZONE))
@@ -236,92 +214,27 @@ def bettergi_processes() -> list[psutil.Process]:
     ]
 
 
-def stop_bettergi_if_exist(logger: logging.Logger, wait_before_relaunch: bool = False) -> None:
-    processes = bettergi_processes()
-    for process in processes:
-        logger.info("Terminating BetterGI.exe (pid=%s).", process.pid)
-        with suppress(psutil.NoSuchProcess, psutil.AccessDenied):
-            process.kill()
-    if processes:
-        _, alive = psutil.wait_procs(processes, timeout=10)
-        if alive:
-            logger.warning("BetterGI still running: %s", [process.pid for process in alive])
-        elif wait_before_relaunch:
-            time.sleep(10)
-
-
 def start_bettergi(config: Config, logger: logging.Logger) -> None:
     executable = config.bettergi_directory / "BetterGI.exe"
     if not executable.is_file():
         raise FileNotFoundError(f"BetterGI.exe not found: {executable}")
-    command = [str(executable), "--startGroups", *config.groups]
+    command = [str(executable), "startOneDragon"]
     logger.info("Launching command: %r", command)
     subprocess.Popen(command)
 
 
-def yuanshen_processes() -> list[psutil.Process]:
-    return [
-        process for process in psutil.process_iter(["pid", "name"])
-        if (process.info["name"] or "").lower() == "yuanshen.exe"
-    ]
-
-
-def stop_yuanshen_after_timeout(logger: logging.Logger) -> None:
-    processes = yuanshen_processes()
-    if not processes:
-        logger.warning("Timeout fallback checked YuanShen.exe: process does not exist.")
-        return
-
-    logger.warning(
-        "Timeout fallback checked YuanShen.exe: process exists (pids=%s); forcing it to close.",
-        [process.pid for process in processes],
-    )
-    for process in processes:
-        with suppress(psutil.NoSuchProcess, psutil.AccessDenied):
-            process.kill()
-    _, alive = psutil.wait_procs(processes, timeout=10)
-    if alive:
-        logger.error("YuanShen.exe still running after kill: %s", [process.pid for process in alive])
-    else:
-        logger.info("YuanShen.exe was forcibly closed by the timeout fallback.")
-
-
-def wait_for_yuanshen_to_close(
-    logger: logging.Logger,
-    start_deadline: float,
-    close_timeout_minutes: int,
-) -> bool:
-    logger.info(
-        "Waiting for YuanShen.exe to start and then close (close timeout: %d minutes).",
-        close_timeout_minutes,
-    )
-    seen_running = bool(yuanshen_processes())
-    close_deadline = (
-        time.monotonic() + close_timeout_minutes * 60 if seen_running else None
-    )
+def wait_for_bettergi_to_close(logger: logging.Logger) -> None:
+    logger.info("Waiting for BetterGI.exe to close.")
     stopped_at: float | None = None
     while True:
         now = time.monotonic()
-        if yuanshen_processes():
-            if not seen_running:
-                close_deadline = now + close_timeout_minutes * 60
-                logger.info("YuanShen.exe started; close timeout countdown begins.")
-            seen_running, stopped_at = True, None
-            if close_deadline is not None and now >= close_deadline:
-                logger.error(
-                    "Abnormal run: YuanShen.exe did not close within %d minutes.",
-                    close_timeout_minutes,
-                )
-                stop_yuanshen_after_timeout(logger)
-                return False
-        elif seen_running:
+        if bettergi_processes():
+            stopped_at = None
+        else:
             stopped_at = stopped_at or now
             if now - stopped_at >= 10:
-                logger.info("YuanShen.exe has closed.")
-                return True
-        elif now >= start_deadline:
-            logger.error("YuanShen.exe did not start within 10 minutes; ending this run.")
-            return False
+                logger.info("BetterGI.exe has closed.")
+                return
         time.sleep(1)
 
 
@@ -348,29 +261,19 @@ def main() -> int:
         logger.exception("Invalid configuration.")
         return 1
 
-    logger.info("Loaded groups: %s", config.groups)
     logger.info(
         "Schedule: MODE=%s, BASE_TIME=%02d:%02d, DAILY_OFFSET_MINUTES=%d, CYCLE_DAYS=%d.",
         config.mode,
         config.base_hour, config.base_minute, config.daily_offset_minutes, config.cycle_days,
     )
-    logger.info("YuanShen.exe close timeout: %d minutes.", config.yuanshen_close_timeout_minutes)
-
     system = SystemState(logger)
     run_end_action = True
     try:
         system.prepare()                     # Prepare: prevent sleep, mute audio, dim brightness.
         wait_for_schedule(config, logger, started_at)
-        game_start_deadline = time.monotonic() + GAME_START_TIMEOUT_SECONDS
-        stop_bettergi_if_exist(logger, True) # Prepare: remove an old BetterGI instance.
         start_bettergi(config, logger)       # Run BetterGI.
-        game_closed_normally = wait_for_yuanshen_to_close(
-            logger,
-            game_start_deadline,
-            config.yuanshen_close_timeout_minutes,
-        )
-        stop_bettergi_if_exist(logger)
-        return 0 if game_closed_normally else 1
+        wait_for_bettergi_to_close(logger)
+        return 0
     except KeyboardInterrupt:
         run_end_action = False
         logger.info("Interrupted by user; the configured end action will not run.")
